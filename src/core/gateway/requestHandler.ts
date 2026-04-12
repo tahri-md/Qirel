@@ -1,6 +1,6 @@
 import jwt from "jsonwebtoken";
-import type { GatewayRequest, GatewayResponse } from "../../models/gateway.js";
-import type { QueryPlanner, PlanStep, ExecutionPlan } from "../planner/QueryPlanner.js";
+import type { GatewayRequest, GatewayResponse } from "./types.js";
+import { QueryPlanner, type ExecutionPlan } from "../planner/QueryPlanner.js";
 import { env } from "../../configs/env.js";
 
 export class RequestHandler {
@@ -55,14 +55,23 @@ export class RequestHandler {
         const errors: any[] = [];
         let cacheHit = false;
 
-        for (const step of plan.steps) {
+        for (const stage of plan.stages) {
             try {
-                const result = await this.executeStepWithRetries(step, request, traceId);
-                subgraphCalls++;
-                aggregatedData[step.field] = result;
+                const stageResults = await Promise.all(
+                    stage.operations.map((op) =>
+                        this.executeOperationWithRetries(op, request, traceId)
+                    )
+                );
+
+                subgraphCalls += stage.operations.length;
+
+                for (let i = 0; i < stageResults.length; i++) {
+                    const op = stage.operations[i]!;
+                    aggregatedData[op.subgraphName] = stageResults[i];
+                }
             } catch (error) {
                 errors.push({
-                    message: `Failed to execute step for field '${step.field}'`,
+                    message: `Failed to execute stage '${stage.stageId}'`,
                     error: (error as Error).message,
                 });
             }
@@ -83,12 +92,16 @@ export class RequestHandler {
         };
     }
 
-    private async executeStepWithRetries(step: PlanStep, request: GatewayRequest, traceId: string): Promise<any> {
+    private async executeOperationWithRetries(
+        operation: any,
+        request: GatewayRequest,
+        traceId: string
+    ): Promise<any> {
         let lastError: Error | null = null;
 
         for (let attempt = 0; attempt <= this.retryCount; attempt++) {
             try {
-                return await this.executeStepWithTimeout(step, request, traceId);
+                return await this.executeOperationWithTimeout(operation, request, traceId);
             } catch (error) {
                 lastError = error as Error;
                 if (attempt < this.retryCount) {
@@ -98,44 +111,59 @@ export class RequestHandler {
             }
         }
 
-        throw new Error(`Step failed after ${this.retryCount + 1} attempts: ${lastError?.message}`);
+        throw new Error(
+            `Operation failed after ${this.retryCount + 1} attempts: ${lastError?.message}`
+        );
     }
 
-    private executeStepWithTimeout(step: PlanStep, request: GatewayRequest, traceId: string): Promise<any> {
+    private executeOperationWithTimeout(
+        operation: any,
+        request: GatewayRequest,
+        traceId: string
+    ): Promise<any> {
         return Promise.race([
-            this.callSubgraph(step, request, traceId),
+            this.callSubgraph(operation, request, traceId),
             new Promise((_, reject) =>
-                setTimeout(() => reject(new Error(`Request timeout after ${this.requestTimeout}ms`)), this.requestTimeout)
+                setTimeout(
+                    () => reject(new Error(`Request timeout after ${this.requestTimeout}ms`)),
+                    this.requestTimeout
+                )
             ),
         ]);
     }
 
-    private async callSubgraph(step: PlanStep, request: GatewayRequest, traceId: string): Promise<any> {
-        const serviceBaseURL = this.getServiceBaseURL(step.service);
-        
-        if (!serviceBaseURL) {
-            throw new Error(`No base URL configured for service: ${step.service}`);
-        }
+    private async callSubgraph(
+        operation: any,
+        request: GatewayRequest,
+        traceId: string
+    ): Promise<any> {
+        const serviceBaseURL = this.getServiceBaseURL(operation.subgraphName);
 
-        const query = this.buildQuery(step.field, request);
+        if (!serviceBaseURL) {
+            throw new Error(
+                `No base URL configured for service: ${operation.subgraphName}`
+            );
+        }
 
         const response = await fetch(`${serviceBaseURL}/graphql`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "Authorization": `Bearer ${request.headers?.authorization?.split(" ")[1] || ""}`,
+                Authorization: `Bearer ${request.headers?.authorization?.split(" ")[1] || ""}`,
                 "X-Trace-ID": traceId,
                 "X-User-ID": request.userId || "",
             },
             body: JSON.stringify({
-                query,
-                variables: request.variables,
+                query: operation.query || request.query,
+                variables: operation.variables || request.variables,
                 operationName: request.operationName,
             }),
         });
 
         if (!response.ok) {
-            throw new Error(`Subgraph request failed with status ${response.status}`);
+            throw new Error(
+                `Subgraph request failed with status ${response.status}`
+            );
         }
 
         const result = await response.json();
@@ -155,15 +183,5 @@ export class RequestHandler {
         };
 
         return serviceURLs[service] || null;
-    }
-
-    private buildQuery(field: string, request: GatewayRequest): string {
-        return `
-            query {
-                ${field} {
-                    __typename
-                }
-            }
-        `;
     }
 }
