@@ -7,7 +7,7 @@ import type {
     SelectionSet,
     Field,
     Selection
-} from "../../models/queryparsing.js";
+} from "./types.js";
 
 export function parseQuery(query: string): GraphQLDocument {
     const parsed = parse(query);
