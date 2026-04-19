@@ -67,12 +67,16 @@ export class ResultMerger {
 
     resolveExternalReferences(data: any, context: ExecutionContext): any {
         const stitchedEntities = this.getStitchedEntitiesFromContext(context);
-        return this.resolveNode(data, stitchedEntities);
+        return this.resolveNode(data, stitchedEntities, new Set<string>());
     }
 
-    private resolveNode(value: unknown, stitchedEntities: StitchedEntities): unknown {
+    private resolveNode(
+        value: unknown,
+        stitchedEntities: StitchedEntities,
+        activeEntityKeys: Set<string>
+    ): unknown {
         if (Array.isArray(value)) {
-            return value.map((item) => this.resolveNode(item, stitchedEntities));
+            return value.map((item) => this.resolveNode(item, stitchedEntities, activeEntityKeys));
         }
 
         if (!this.isRecord(value)) {
@@ -82,7 +86,14 @@ export class ResultMerger {
         if (typeof value.__ref === "string") {
             const byRef = this.getEntityByRef(value.__ref, stitchedEntities);
             if (byRef) {
-                return this.resolveNode(byRef, stitchedEntities);
+                if (activeEntityKeys.has(value.__ref)) {
+                    return byRef;
+                }
+
+                activeEntityKeys.add(value.__ref);
+                const resolvedByRef = this.resolveNode(byRef, stitchedEntities, activeEntityKeys);
+                activeEntityKeys.delete(value.__ref);
+                return resolvedByRef;
             }
         }
 
@@ -92,14 +103,22 @@ export class ResultMerger {
         if (typename && entityId) {
             const stitched = stitchedEntities[typename]?.[entityId];
             if (stitched) {
+                const entityKey = `${typename}:${entityId}`;
+                if (activeEntityKeys.has(entityKey)) {
+                    return value;
+                }
+
+                activeEntityKeys.add(entityKey);
                 const merged = { ...stitched, ...value };
-                return this.resolveNode(merged, stitchedEntities);
+                const resolved = this.resolveNode(merged, stitchedEntities, activeEntityKeys);
+                activeEntityKeys.delete(entityKey);
+                return resolved;
             }
         }
 
         const resolved: Record<string, unknown> = {};
         for (const [key, nestedValue] of Object.entries(value)) {
-            resolved[key] = this.resolveNode(nestedValue, stitchedEntities);
+            resolved[key] = this.resolveNode(nestedValue, stitchedEntities, activeEntityKeys);
         }
 
         return resolved;
