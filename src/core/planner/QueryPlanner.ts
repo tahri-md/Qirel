@@ -1,5 +1,13 @@
-import type { GraphQLDocument, OperationDefinition, SelectionSet, Field } from "../parser/types.js";
-import { parseQuery, validateQuery } from "../parser/QueryParser.js";
+import {
+  Kind,
+  parse,
+  print,
+  type DocumentNode,
+  type FieldNode,
+  type OperationDefinitionNode,
+  type SelectionNode,
+} from "graphql";
+import { validateQuery } from "../parser/QueryParser.js";
 import type { ExecutionPlan, ExecutionStage, SubgraphOperation, FieldMapping, SubgraphSchema, DependencyNode } from "./types.js";
 
 export class QueryPlanner {
@@ -20,33 +28,38 @@ export class QueryPlanner {
   }
 
   private extractFieldsFromSelection(
-    selections: any[],
+    selections: readonly SelectionNode[],
     parentDepth: number = 0
   ): FieldMapping[] {
     const fields: FieldMapping[] = [];
 
     for (const selection of selections) {
-      if (selection.kind === "Field") {
-        const fieldName = selection.name.value;
-        const subgraph = this.fieldToSubgraphMap.get(fieldName);
-
-        if (subgraph) {
-          const mapping: FieldMapping = {
-            fieldName,
-            subgraph,
-            depth: parentDepth,
-          };
-
-          if (selection.selectionSet) {
-            mapping.children = this.extractFieldsFromSelection(
-              selection.selectionSet.selections,
-              parentDepth + 1
-            );
-          }
-
-          fields.push(mapping);
-        }
+      if (selection.kind !== Kind.FIELD) {
+        continue;
       }
+
+      const fieldName = selection.name.value;
+      const subgraph = this.fieldToSubgraphMap.get(fieldName);
+      const children = selection.selectionSet
+        ? this.extractFieldsFromSelection(selection.selectionSet.selections, parentDepth + 1)
+        : [];
+
+      if (!subgraph) {
+        fields.push(...children);
+        continue;
+      }
+
+      const mapping: FieldMapping = {
+        fieldName,
+        subgraph,
+        depth: parentDepth,
+      };
+
+      if (children.length > 0) {
+        mapping.children = children;
+      }
+
+      fields.push(mapping);
     }
 
     return fields;
@@ -97,6 +110,7 @@ export class QueryPlanner {
   private buildDependencyNodes(
     dependencies: Map<string, Set<string>>
   ): DependencyNode[] {
+    const depthCache = new Map<string, number>();
     const nodes: DependencyNode[] = [];
 
     for (const [subgraph, deps] of dependencies) {
@@ -104,53 +118,58 @@ export class QueryPlanner {
         field: subgraph,
         subgraph,
         dependencies: deps,
-        depth: 0,
+        depth: this.calculateNodeDepth(subgraph, dependencies, depthCache, new Set()),
       });
-    }
-
-    for (const node of nodes) {
-      node.depth = this.calculateNodeDepth(node, new Set());
     }
 
     return nodes;
   }
 
   private calculateNodeDepth(
-    node: DependencyNode,
+    subgraph: string,
+    dependencies: Map<string, Set<string>>,
+    cache: Map<string, number>,
     visited: Set<string>
   ): number {
-    if (visited.has(node.subgraph)) {
+    if (cache.has(subgraph)) {
+      return cache.get(subgraph)!;
+    }
+
+    if (visited.has(subgraph)) {
       return 0;
     }
 
-    if (node.dependencies.size === 0) {
+    const deps = dependencies.get(subgraph);
+    if (!deps || deps.size === 0) {
+      cache.set(subgraph, 0);
       return 0;
     }
 
-    visited.add(node.subgraph);
+    visited.add(subgraph);
     let maxDepth = 0;
 
-    for (const depGraph of node.dependencies) {
-      const depNode = { field: depGraph, subgraph: depGraph, dependencies: new Set<string>(), depth: 0 };
-      const foundDep = Array.from(node.dependencies).map(dep => ({
-        field: dep,
-        subgraph: dep,
-        dependencies: new Set<string>(),
-        depth: 0
-      }));
-      const actualDepNode = foundDep.find(n => n.subgraph === depGraph);
-      if (actualDepNode) {
-        const depDepth = this.calculateNodeDepth(actualDepNode, new Set(visited));
-        maxDepth = Math.max(maxDepth, depDepth);
-      }
+    for (const dependency of deps) {
+      const dependencyDepth = this.calculateNodeDepth(
+        dependency,
+        dependencies,
+        cache,
+        new Set(visited)
+      );
+      maxDepth = Math.max(maxDepth, dependencyDepth);
     }
 
-    visited.delete(node.subgraph);
-    return maxDepth + 1;
+    visited.delete(subgraph);
+    const depth = maxDepth + 1;
+    cache.set(subgraph, depth);
+    return depth;
   }
 
   private generateExecutionStages(
-    nodes: DependencyNode[]
+    nodes: DependencyNode[],
+    subgraphQueries: Map<string, string>,
+    subgraphFields: Map<string, string[]>,
+    variables: Record<string, any> | undefined,
+    fallbackQuery: string
   ): ExecutionStage[] {
     const stages: ExecutionStage[] = [];
     const processed = new Set<string>();
@@ -171,9 +190,9 @@ export class QueryPlanner {
         stageId: `stage-${stageNumber}`,
         operations: readyNodes.map((node) => ({
           subgraphName: node.subgraph,
-          query: "",
-          variables: {},
-          fields: [],
+          query: subgraphQueries.get(node.subgraph) ?? fallbackQuery,
+          variables: variables ?? {},
+          fields: subgraphFields.get(node.subgraph) ?? [],
           expectedResponseTime: this.getExpectedResponseTime(node.subgraph),
         })),
         dependencies: Array.from(
@@ -182,11 +201,10 @@ export class QueryPlanner {
           )
         ),
         parallel: true,
-        estimatedDuration: Math.max(
-          ...readyNodes.map((node) =>
-            this.getExpectedResponseTime(node.subgraph)
-          )
-        ),
+        estimatedDuration:
+          readyNodes.length > 0
+            ? Math.max(...readyNodes.map((node) => this.getExpectedResponseTime(node.subgraph)))
+            : 0,
       };
 
       stages.push(stage);
@@ -214,24 +232,122 @@ export class QueryPlanner {
     return max;
   }
 
+  private buildSubgraphQueries(
+    operation: OperationDefinitionNode,
+    originalDocument: DocumentNode
+  ): Map<string, string> {
+    const groupedSelections = new Map<string, FieldNode[]>();
+
+    for (const selection of operation.selectionSet.selections) {
+      if (selection.kind !== Kind.FIELD) {
+        continue;
+      }
+
+      const subgraph = this.fieldToSubgraphMap.get(selection.name.value);
+      if (!subgraph) {
+        continue;
+      }
+
+      const existing = groupedSelections.get(subgraph) ?? [];
+      existing.push(selection);
+      groupedSelections.set(subgraph, existing);
+    }
+
+    const queries = new Map<string, string>();
+
+    for (const [subgraph, selections] of groupedSelections.entries()) {
+      const subgraphOperationBase: OperationDefinitionNode = {
+        ...operation,
+        selectionSet: {
+          ...operation.selectionSet,
+          selections,
+        },
+      };
+
+      const subgraphOperation: OperationDefinitionNode = operation.name
+        ? {
+            ...subgraphOperationBase,
+            name: {
+              ...operation.name,
+              value: `${operation.name.value}_${subgraph}`,
+            },
+          }
+        : subgraphOperationBase;
+
+      const subgraphDocument: DocumentNode = {
+        ...originalDocument,
+        definitions: [subgraphOperation],
+      };
+
+      queries.set(subgraph, print(subgraphDocument));
+    }
+
+    return queries;
+  }
+
+  private collectSubgraphFields(fieldMappings: FieldMapping[]): Map<string, string[]> {
+    const map = new Map<string, Set<string>>();
+
+    const walk = (mappings: FieldMapping[]) => {
+      for (const mapping of mappings) {
+        const current = map.get(mapping.subgraph) ?? new Set<string>();
+        current.add(mapping.fieldName);
+        map.set(mapping.subgraph, current);
+
+        if (mapping.children && mapping.children.length > 0) {
+          walk(mapping.children);
+        }
+      }
+    };
+
+    walk(fieldMappings);
+
+    const result = new Map<string, string[]>();
+    for (const [subgraph, fields] of map.entries()) {
+      result.set(subgraph, Array.from(fields));
+    }
+
+    return result;
+  }
+
   public plan(query: string, variables?: Record<string, any>): ExecutionPlan {
     const validationResult = validateQuery(query, variables);
     if (!validationResult.valid) {
       throw new Error(`Invalid query: ${validationResult.errors.join(", ")}`);
     }
 
-    const parsed = parseQuery(query);
-    const operation = parsed.definitions[0] as OperationDefinition;
+    const parsed = parse(query);
+    const operation = parsed.definitions.find(
+      (definition): definition is OperationDefinitionNode =>
+        definition.kind === Kind.OPERATION_DEFINITION
+    );
+
+    if (!operation) {
+      throw new Error("Query must contain at least one operation");
+    }
 
     const fieldMappings = this.extractFieldsFromSelection(
       operation.selectionSet.selections
     );
 
+    if (fieldMappings.length === 0) {
+      throw new Error("Query does not target any registered subgraph fields");
+    }
+
     const dependencies = this.identifyDependencies(fieldMappings);
 
     const nodes = this.buildDependencyNodes(dependencies);
 
-    const stages = this.generateExecutionStages(nodes);
+    const subgraphQueries = this.buildSubgraphQueries(operation, parsed);
+    const subgraphFields = this.collectSubgraphFields(fieldMappings);
+
+    const stages = this.generateExecutionStages(
+      nodes,
+      subgraphQueries,
+      subgraphFields,
+      variables,
+      query
+    );
 
     const estimatedDuration = this.estimateTotalExecutionTime(stages);
 

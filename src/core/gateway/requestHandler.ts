@@ -1,17 +1,42 @@
 import jwt from "jsonwebtoken";
+import { GraphQLError } from "graphql";
+import type { ExecutionContext, ExecutionResult } from "graphql/execution/execute.js";
 import type { GatewayRequest, GatewayResponse } from "./types.js";
 import { QueryPlanner, type ExecutionPlan } from "../planner/QueryPlanner.js";
+import { DistributedExecutor } from "../executor/QueryExecutor.js";
+import { ResultMerger, type SubgraphResponse } from "../../gateway/resultMerger.js";
 import { env } from "../../configs/env.js";
 
-export class RequestHandler {
-    private requestTimeout: number;
-    private retryCount: number;
-    private planner: QueryPlanner;
+type AuthTokenPayload = {
+    userId: string;
+    permissions: string[];
+};
 
-    constructor(requestTimeout: number, retryCount: number, planner: QueryPlanner) {
+type ExecutorSubgraphResponse = {
+    subgraphName: string;
+    data: Record<string, unknown>;
+    errors?: string[];
+};
+
+export class RequestHandler {
+    private readonly requestTimeout: number;
+    private readonly retryCount: number;
+    private readonly planner: QueryPlanner;
+    private readonly executor: DistributedExecutor;
+    private readonly merger: ResultMerger;
+
+    constructor(
+        requestTimeout: number,
+        retryCount: number,
+        planner: QueryPlanner,
+        executor = new DistributedExecutor(),
+        merger = new ResultMerger()
+    ) {
         this.requestTimeout = requestTimeout;
         this.retryCount = retryCount;
         this.planner = planner;
+        this.executor = executor;
+        this.merger = merger;
     }
 
     async handleRequest(request: GatewayRequest): Promise<GatewayResponse> {
@@ -33,155 +58,184 @@ export class RequestHandler {
     }
 
     private authenticateRequest(request: GatewayRequest): void {
-        if (!request.headers || !request.headers.authorization) {
+        const authorization = this.readHeader(request.headers, "authorization");
+        if (!authorization) {
             throw new Error("Unauthorized");
         }
-        const token = request.headers.authorization.split(" ")[1];
+
+        const token = this.readBearerToken(authorization);
+        if (!token) {
+            throw new Error("Unauthorized");
+        }
+
         try {
-            // @ts-expect-error - env.SECRET_KEY is guaranteed to be a string by zod validation at startup
-            const decoded = jwt.verify(token, env.SECRET_KEY) as unknown as { userId: string; permissions: string[] };
+            const decoded = jwt.verify(token, env.SECRET_KEY) as unknown as AuthTokenPayload;
             request.userId = decoded.userId;
             request.permissions = decoded.permissions;
-        } catch (err) {
+        } catch {
             throw new Error("Unauthorized");
         }
     }
 
     private async executePlan(plan: ExecutionPlan, request: GatewayRequest): Promise<GatewayResponse> {
         const startTime = Date.now();
-        let subgraphCalls = 0;
-        const traceId = `trace-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-        const aggregatedData: Record<string, any> = {};
-        const errors: any[] = [];
-        let cacheHit = false;
+        const traceId = this.readHeader(request.headers, "x-trace-id")
+            || `trace-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
-        for (const stage of plan.stages) {
-            try {
-                const stageResults = await Promise.all(
-                    stage.operations.map((op) =>
-                        this.executeOperationWithRetries(op, request, traceId)
-                    )
-                );
+        const context = this.buildExecutionContext(request, traceId);
+        const executionResult = await this.executor.execute(plan, context);
+        const subgraphResponses = this.collectSubgraphResponses(executionResult);
+        const merged = this.merger.merge(subgraphResponses);
 
-                subgraphCalls += stage.operations.length;
+        const errors: GraphQLError[] = [
+            ...(executionResult.errors ?? []),
+            ...(merged.errors ?? []),
+        ];
 
-                for (let i = 0; i < stageResults.length; i++) {
-                    const op = stage.operations[i]!;
-                    aggregatedData[op.subgraphName] = stageResults[i];
-                }
-            } catch (error) {
-                errors.push({
-                    message: `Failed to execute stage '${stage.stageId}'`,
-                    error: (error as Error).message,
-                });
-            }
-        }
+        const duration = Date.now() - startTime;
 
-        const endTime = Date.now();
-        const duration = endTime - startTime;
-
-        return {
-            data: aggregatedData,
-            errors: errors.length > 0 ? errors as any : undefined,
+        const response: GatewayResponse = {
+            data: merged.data,
             extensions: {
                 duration,
-                subgraphCalls,
-                cacheHit,
+                subgraphCalls: subgraphResponses.length,
+                cacheHit: false,
                 traceId,
             },
         };
+
+        if (errors.length > 0) {
+            response.errors = errors;
+        }
+
+        return response;
     }
 
-    private async executeOperationWithRetries(
-        operation: any,
-        request: GatewayRequest,
-        traceId: string
-    ): Promise<any> {
-        let lastError: Error | null = null;
+    private buildExecutionContext(request: GatewayRequest, traceId: string): ExecutionContext {
+        return {
+            contextValue: {
+                query: request.query,
+                variables: request.variables,
+                operationName: request.operationName,
+                userId: request.userId,
+                headers: this.forwardHeaders(request.headers, traceId),
+                requestTimeoutMs: this.requestTimeout,
+                retryCount: this.retryCount,
+                traceId,
+                useDataLoader: true,
+            },
+        } as unknown as ExecutionContext;
+    }
 
-        for (let attempt = 0; attempt <= this.retryCount; attempt++) {
-            try {
-                return await this.executeOperationWithTimeout(operation, request, traceId);
-            } catch (error) {
-                lastError = error as Error;
-                if (attempt < this.retryCount) {
-                    const delay = Math.pow(2, attempt) * 100;
-                    await new Promise((resolve) => setTimeout(resolve, delay));
+    private collectSubgraphResponses(result: ExecutionResult): SubgraphResponse[] {
+        const responses: SubgraphResponse[] = [];
+        const data = result.data;
+
+        if (!this.isRecord(data)) {
+            return responses;
+        }
+
+        for (const stageValue of Object.values(data)) {
+            if (!Array.isArray(stageValue)) {
+                continue;
+            }
+
+            for (const stageItem of stageValue) {
+                if (!this.isExecutorSubgraphResponse(stageItem)) {
+                    continue;
                 }
+
+                const response: SubgraphResponse = {
+                    subgraphName: stageItem.subgraphName,
+                    data: stageItem.data,
+                };
+
+                if (stageItem.errors && stageItem.errors.length > 0) {
+                    response.errors = stageItem.errors;
+                }
+
+                responses.push(response);
             }
         }
 
-        throw new Error(
-            `Operation failed after ${this.retryCount + 1} attempts: ${lastError?.message}`
-        );
+        return responses;
     }
 
-    private executeOperationWithTimeout(
-        operation: any,
-        request: GatewayRequest,
+    private isExecutorSubgraphResponse(value: unknown): value is ExecutorSubgraphResponse {
+        if (!this.isRecord(value)) {
+            return false;
+        }
+
+        return typeof value.subgraphName === "string" && this.isRecord(value.data);
+    }
+
+    private forwardHeaders(
+        headers: Record<string, string> | undefined,
         traceId: string
-    ): Promise<any> {
-        return Promise.race([
-            this.callSubgraph(operation, request, traceId),
-            new Promise((_, reject) =>
-                setTimeout(
-                    () => reject(new Error(`Request timeout after ${this.requestTimeout}ms`)),
-                    this.requestTimeout
-                )
-            ),
+    ): Record<string, string> {
+        const allowedHeaders = new Set([
+            "authorization",
+            "x-trace-id",
+            "x-request-id",
+            "x-correlation-id",
         ]);
-    }
 
-    private async callSubgraph(
-        operation: any,
-        request: GatewayRequest,
-        traceId: string
-    ): Promise<any> {
-        const serviceBaseURL = this.getServiceBaseURL(operation.subgraphName);
-
-        if (!serviceBaseURL) {
-            throw new Error(
-                `No base URL configured for service: ${operation.subgraphName}`
-            );
-        }
-
-        const response = await fetch(`${serviceBaseURL}/graphql`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${request.headers?.authorization?.split(" ")[1] || ""}`,
-                "X-Trace-ID": traceId,
-                "X-User-ID": request.userId || "",
-            },
-            body: JSON.stringify({
-                query: operation.query || request.query,
-                variables: operation.variables || request.variables,
-                operationName: request.operationName,
-            }),
-        });
-
-        if (!response.ok) {
-            throw new Error(
-                `Subgraph request failed with status ${response.status}`
-            );
-        }
-
-        const result = await response.json();
-
-        if (result.errors) {
-            throw new Error(`Subgraph returned errors: ${JSON.stringify(result.errors)}`);
-        }
-
-        return result.data;
-    }
-
-    private getServiceBaseURL(service: string): string | null {
-        const serviceURLs: Record<string, string> = {
-            users: process.env.USERS_SERVICE_URL || "http://localhost:4001",
-            orders: process.env.ORDERS_SERVICE_URL || "http://localhost:4002",
-            products: process.env.PRODUCTS_SERVICE_URL || "http://localhost:4003",
+        const forwarded: Record<string, string> = {
+            "x-trace-id": traceId,
         };
 
-        return serviceURLs[service] || null;
+        if (!headers) {
+            return forwarded;
+        }
+
+        for (const [key, value] of Object.entries(headers)) {
+            if (!value) {
+                continue;
+            }
+
+            const normalizedKey = key.toLowerCase();
+            if (!allowedHeaders.has(normalizedKey) && !normalizedKey.startsWith("x-")) {
+                continue;
+            }
+
+            forwarded[normalizedKey] = value;
+        }
+
+        return forwarded;
+    }
+
+    private readHeader(
+        headers: Record<string, string> | undefined,
+        headerName: string
+    ): string | null {
+        if (!headers) {
+            return null;
+        }
+
+        const target = headerName.toLowerCase();
+        for (const [key, value] of Object.entries(headers)) {
+            if (key.toLowerCase() === target && value) {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private readBearerToken(authorization: string): string | null {
+        const trimmed = authorization.trim();
+        if (!trimmed) {
+            return null;
+        }
+
+        if (trimmed.toLowerCase().startsWith("bearer ")) {
+            return trimmed.slice(7).trim() || null;
+        }
+
+        return trimmed;
+    }
+
+    private isRecord(value: unknown): value is Record<string, unknown> {
+        return typeof value === "object" && value !== null && !Array.isArray(value);
     }
 }
